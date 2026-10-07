@@ -1,0 +1,10 @@
+{
+  "name": "memory-match",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Classic Memory Match card game — single-file web toy with a tested core.",
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

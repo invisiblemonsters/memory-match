@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory Match</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #0d1117; color: #e6edf3;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .game { width: min(620px, 96vw); padding: 20px; text-align: center; }
+  h1 { margin: 0 0 2px; font-size: 20px; font-weight: 600; letter-spacing: .02em; }
+  .sub { margin: 0 0 14px; font-size: 12px; color: #8b949e; }
+  .stats {
+    display: flex; gap: 6px 18px; justify-content: center; flex-wrap: wrap;
+    margin: 0 0 14px; font-size: 13px; color: #8b949e;
+  }
+  .stats b { color: #e6edf3; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .board {
+    display: grid; grid-template-columns: repeat(var(--cols, 4), 1fr);
+    gap: 8px; margin: 0 auto; max-width: 560px;
+  }
+  .card {
+    aspect-ratio: 1 / 1; display: grid; place-items: center; padding: 0;
+    border-radius: 10px; border: 1px solid #30363d; cursor: pointer;
+    background: linear-gradient(160deg, #21262d, #161b22);
+    color: #e6edf3; font-size: clamp(22px, 6vw, 34px); line-height: 1;
+    transition: transform .12s ease, background .12s ease, border-color .12s ease;
+  }
+  .card:hover { background: linear-gradient(160deg, #2d333b, #1c2128); }
+  .card.up { background: #1f6feb26; border-color: #1f6feb99; transform: scale(1.03); }
+  .card.matched { background: #2ea04326; border-color: #2ea043aa; cursor: default; }
+  .card.matched:hover { background: #2ea04326; }
+  .controls { display: flex; gap: 10px; justify-content: center; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+  button, select {
+    font: inherit; font-size: 14px; padding: 8px 14px; border-radius: 8px;
+    border: 1px solid #30363d; background: #21262d; color: #e6edf3; cursor: pointer;
+  }
+  button:hover, select:hover { background: #30363d; }
+  .status { margin: 14px 0 0; font-size: 14px; font-weight: 600; min-height: 20px; color: #e6edf3; }
+</style>
+</head>
+<body>
+  <main class="game">
+    <h1>Memory Match</h1>
+    <p class="sub">Flip two cards — matching pairs stay face-up</p>
+    <div class="stats">
+      <span>Moves <b id="moves">0</b></span>
+      <span>Pairs <b id="pairs">0/8</b></span>
+      <span>Time <b id="time">0:00</b></span>
+      <span>Best <b id="best">—</b></span>
+    </div>
+    <div id="board" class="board" aria-label="Memory match board"></div>
+    <div class="controls">
+      <select id="size" aria-label="Board size">
+        <option value="small">Small — 4×3</option>
+        <option value="medium" selected>Medium — 4×4</option>
+        <option value="large">Large — 6×4</option>
+      </select>
+      <button id="new-game">New game</button>
+    </div>
+    <p class="status" id="status">Flip two cards to find a pair</p>
+  </main>
+<script>
+(function (global) {
+  'use strict';
+
+  // ---- core -----------------------------------------------------------------
+
+  var SYMBOLS = ['🍎', '🍌', '🍇', '🍒', '🍋', '🥝', '🍑', '🍍', '🥥', '🍉', '🫐', '🍊'];
+
+  var SIZES = {
+    small:  { cols: 4, rows: 3, pairs: 6 },
+    medium: { cols: 4, rows: 4, pairs: 8 },
+    large:  { cols: 6, rows: 4, pairs: 12 }
+  };
+
+  var MISMATCH_MS = 900;
+  var TICK_MS = 250;
+
+  function mulberry32(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (s + 0x6d2b79f5) >>> 0;
+      var t = s;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function toRng(seedOrRng) {
+    if (typeof seedOrRng === 'function') return seedOrRng;
+    if (seedOrRng == null) return Math.random;
+    if (typeof seedOrRng === 'number' && isFinite(seedOrRng)) return mulberry32(seedOrRng);
+    throw new RangeError('rng must be a function or a finite number seed');
+  }
+
+  function assertPairs(pairs) {
+    if (!Number.isInteger(pairs) || pairs < 1 || pairs > SYMBOLS.length) {
+      throw new RangeError('pairs must be an integer between 1 and ' + SYMBOLS.length);
+    }
+  }
+
+  // A deck is `pairs` symbols, each appearing exactly twice, shuffled with a
+  // seeded (or injected) PRNG so games are reproducible.
+  function buildDeck(pairs, seedOrRng) {
+    assertPairs(pairs);
+    var rng = toRng(seedOrRng);
+    var cards = [];
+    for (var i = 0; i < pairs; i++) {
+      cards.push(SYMBOLS[i]);
+      cards.push(SYMBOLS[i]);
+    }
+    for (var k = cards.length - 1; k > 0; k--) {
+      var j = Math.min(k, Math.floor(rng() * (k + 1)));
+      var tmp = cards[k];
+      cards[k] = cards[j];
+      cards[j] = tmp;
+    }
+    return cards;
+  }
+
+  function createGame(config) {
+    config = config || {};
+    var pairs = config.pairs;
+    assertPairs(pairs);
+    var rng = toRng(config.rng != null ? config.rng : config.seed);
+    var deck = buildDeck(pairs, rng);
+    var n = deck.length;
+
+    var revealed = [];
+    for (var i = 0; i < n; i++) revealed.push(false);
+    var faceUp = [];
+    var moves = 0;
+    var matched = 0;
+    var pending = null;
+    var won = false;
+
+    function flip(index) {
+      if (!Number.isInteger(index) || index < 0 || index >= n) {
+        return { state: 'ignored', reason: 'bad-index' };
+      }
+      if (won) return { state: 'ignored', reason: 'won' };
+      if (pending) return { state: 'ignored', reason: 'busy' };
+      if (revealed[index]) return { state: 'ignored', reason: 'revealed' };
+      if (faceUp.indexOf(index) !== -1) return { state: 'ignored', reason: 'up' };
+
+      if (faceUp.length === 0) {
+        faceUp.push(index);
+        return { state: 'flip', index: index, symbol: deck[index] };
+      }
+
+      var a = faceUp[0];
+      faceUp.push(index);
+      moves += 1;
+      if (deck[a] === deck[index]) {
+        revealed[a] = true;
+        revealed[index] = true;
+        faceUp = [];
+        matched += 1;
+        if (matched === pairs) won = true;
+        return { state: 'match', a: a, b: index, symbol: deck[a], moves: moves, won: won };
+      }
+      pending = { a: a, b: index };
+      return { state: 'mismatch', a: a, b: index, moves: moves };
+    }
+
+    // Called once the two non-matching cards have been shown long enough.
+    // Returns the pair that flipped back, or null when there was nothing to do.
+    function resolveMismatch() {
+      if (!pending) return null;
+      var pair = { a: pending.a, b: pending.b };
+      pending = null;
+      faceUp = [];
+      return pair;
+    }
+
+    function getState() {
+      return {
+        deck: deck.slice(),
+        revealed: revealed.slice(),
+        faceUp: faceUp.slice(),
+        moves: moves,
+        matched: matched,
+        pairs: pairs,
+        won: won,
+        busy: pending !== null,
+        pending: pending ? { a: pending.a, b: pending.b } : null
+      };
+    }
+
+    return { flip: flip, resolveMismatch: resolveMismatch, getState: getState };
+  }
+
+  function formatTime(ms) {
+    if (!Number.isFinite(ms) || ms < 0) ms = 0;
+    var total = Math.floor(ms / 1000);
+    var m = Math.floor(total / 60);
+    var s = total % 60;
+    return m + ':' + (s < 10 ? '0' + s : String(s));
+  }
+
+  var MemoryMatch = {
+    SYMBOLS: SYMBOLS,
+    SIZES: SIZES,
+    MISMATCH_MS: MISMATCH_MS,
+    TICK_MS: TICK_MS,
+    mulberry32: mulberry32,
+    buildDeck: buildDeck,
+    createGame: createGame,
+    formatTime: formatTime
+  };
+
+  // ---- UI -------------------------------------------------------------------
+
+  function initUI(doc, deps) {
+    deps = deps || {};
+    var schedule = deps.schedule || function (fn, ms) { return global.setTimeout(fn, ms); };
+    var now = deps.now || function () { return Date.now(); };
+    var seedFn = deps.seedFn || function () { return Math.floor(Math.random() * 4294967296); };
+
+    var els = {
+      board: doc.getElementById('board'),
+      moves: doc.getElementById('moves'),
+      pairs: doc.getElementById('pairs'),
+      time: doc.getElementById('time'),
+      best: doc.getElementById('best'),
+      size: doc.getElementById('size'),
+      status: doc.getElementById('status'),
+      newGame: doc.getElementById('new-game')
+    };
+
+    var sizeKey = 'medium';
+    var game = null;
+    var cards = [];
+    var gen = 0;
+    var timerStart = null;
+    var timerStopped = null;
+    var newBest = false;
+    var bestBySize = { small: null, medium: null, large: null };
+
+    function readSize() {
+      var value = els.size && els.size.value;
+      return Object.prototype.hasOwnProperty.call(SIZES, value) ? value : 'medium';
+    }
+
+    function elapsedMs() {
+      if (timerStart === null) return 0;
+      return (timerStopped !== null ? timerStopped : now()) - timerStart;
+    }
+
+    function bestText() {
+      var best = bestBySize[sizeKey];
+      return best ? best.moves + ' moves · ' + formatTime(best.ms) : '—';
+    }
+
+    function statusText() {
+      var st = game.getState();
+      if (st.won) {
+        return 'You win — ' + st.moves + ' moves, ' + formatTime(elapsedMs()) + (newBest ? ' (new best)' : '');
+      }
+      if (st.busy) return 'No match — flipping back…';
+      if (st.faceUp.length === 1) return 'Pick a second card';
+      if (st.moves === 0) return 'Flip two cards to find a pair';
+      return 'Find the matching pairs';
+    }
+
+    function render() {
+      var st = game.getState();
+      for (var i = 0; i < cards.length; i++) {
+        var el = cards[i];
+        var cls = 'card';
+        var label;
+        if (st.revealed[i]) {
+          cls += ' matched';
+          el.textContent = st.deck[i];
+          label = 'Card ' + (i + 1) + ', matched ' + st.deck[i];
+        } else if (st.faceUp.indexOf(i) !== -1) {
+          cls += ' up';
+          el.textContent = st.deck[i];
+          label = 'Card ' + (i + 1) + ', showing ' + st.deck[i];
+        } else {
+          el.textContent = '';
+          label = 'Card ' + (i + 1) + ', face down';
+        }
+        if (el.className !== cls) el.className = cls;
+        el.disabled = !!st.revealed[i];
+        el.setAttribute('aria-label', label);
+      }
+      els.moves.textContent = String(st.moves);
+      els.pairs.textContent = st.matched + '/' + st.pairs;
+      els.time.textContent = formatTime(elapsedMs());
+      els.best.textContent = bestText();
+      els.status.textContent = statusText();
+    }
+
+    function scheduleTick() {
+      var myGen = gen;
+      schedule(function () {
+        if (myGen !== gen) return;
+        if (timerStart === null || timerStopped !== null) return;
+        els.time.textContent = formatTime(elapsedMs());
+        scheduleTick();
+      }, TICK_MS);
+    }
+
+    function updateBest() {
+      var st = game.getState();
+      var ms = elapsedMs();
+      var best = bestBySize[sizeKey];
+      if (!best || st.moves < best.moves || (st.moves === best.moves && ms < best.ms)) {
+        bestBySize[sizeKey] = { moves: st.moves, ms: ms };
+        newBest = true;
+      } else {
+        newBest = false;
+      }
+    }
+
+    function onFlip(index) {
+      var result = game.flip(index);
+      if (result.state === 'ignored') return;
+
+      if (timerStart === null) {
+        timerStart = now();
+        scheduleTick();
+      }
+
+      if (result.state === 'mismatch') {
+        var myGen = gen;
+        var g = game;
+        schedule(function () {
+          if (myGen !== gen || g !== game) return;
+          var pair = g.resolveMismatch();
+          if (pair) render();
+        }, MISMATCH_MS);
+      }
+
+      if (result.state === 'match' && result.won) {
+        timerStopped = now();
+        updateBest();
+      }
+
+      render();
+    }
+
+    function makeCard(index) {
+      var card = doc.createElement('button');
+      card.type = 'button';
+      card.className = 'card';
+      card.setAttribute('aria-label', 'Card ' + (index + 1) + ', face down');
+      card.addEventListener('click', function () { onFlip(index); });
+      els.board.appendChild(card);
+      return card;
+    }
+
+    function buildBoard() {
+      while (els.board.firstChild) els.board.removeChild(els.board.firstChild);
+      cards = [];
+      var size = SIZES[sizeKey];
+      els.board.style.setProperty('--cols', String(size.cols));
+      for (var i = 0; i < size.pairs * 2; i++) {
+        cards.push(makeCard(i));
+      }
+    }
+
+    function newGame() {
+      gen += 1;
+      sizeKey = readSize();
+      var size = SIZES[sizeKey];
+      game = createGame({ pairs: size.pairs, seed: seedFn() });
+      timerStart = null;
+      timerStopped = null;
+      newBest = false;
+      buildBoard();
+      render();
+    }
+
+    els.newGame.addEventListener('click', function () { newGame(); });
+    els.size.addEventListener('change', function (event) {
+      var value = event && event.target ? event.target.value : els.size.value;
+      if (value && Object.prototype.hasOwnProperty.call(SIZES, value)) {
+        els.size.value = value;
+      }
+      newGame();
+    });
+
+    newGame();
+
+    return {
+      getGame: function () { return game; },
+      getCards: function () { return cards.slice(); },
+      getSizeKey: function () { return sizeKey; },
+      getElapsedMs: function () { return elapsedMs(); },
+      getGen: function () { return gen; },
+      render: render
+    };
+  }
+
+  var MemoryMatchUI = { initUI: initUI };
+
+  function boot() {
+    initUI(document, {});
+  }
+
+  global.MemoryMatch = MemoryMatch;
+  global.MemoryMatchUI = MemoryMatchUI;
+
+  if (typeof document !== 'undefined' && document.getElementById) {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', boot);
+    } else {
+      boot();
+    }
+  }
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+</body>
+</html>
